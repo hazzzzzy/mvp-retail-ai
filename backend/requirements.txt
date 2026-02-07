@@ -1,0 +1,16 @@
+﻿fastapi
+uvicorn[standard]
+sqlalchemy>=2
+aiomysql
+pydantic>=2
+pydantic-settings
+openai
+langgraph
+chromadb
+sentence-transformers
+torch
+sqlglot
+python-dotenv
+faker
+httpx
+anyio

@@ -1,0 +1,36 @@
+﻿# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+.venv/
+venv/
+backend/.venv/
+
+# Node
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# Env
+.env
+backend/.env
+frontend/.env
+
+# Runtime logs
+*.log
+backend/backend_server.log
+backend/smoke_run.log
+frontend/frontend_server.log
+
+# Local data
+backend/.chroma/
+backend/models/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,11 +1,13 @@
 ﻿<template>
-  <div class="plan-card">
-    <div class="head">
-      <strong>活动方案</strong>
-      <button @click="$emit('execute')">执行上架（场景D）</button>
-    </div>
+  <el-card class="plan-card" shadow="never">
+    <template #header>
+      <div class="head">
+        <strong>活动方案</strong>
+        <el-button type="success" @click="$emit('execute')">执行上架（场景D）</el-button>
+      </div>
+    </template>
     <div class="content markdown-body" v-html="planSummaryHtml"></div>
-  </div>
+  </el-card>
 </template>
 
 <script setup lang="ts">
@@ -53,10 +55,6 @@ const planSummaryHtml = computed(() => {
 <style scoped>
 .plan-card {
   margin-top: 10px;
-  border: 1px solid #86efac;
-  border-radius: 10px;
-  padding: 10px;
-  background: #f0fdf4;
 }
 
 .head {
@@ -65,17 +63,7 @@ const planSummaryHtml = computed(() => {
   align-items: center;
 }
 
-button {
-  border: none;
-  border-radius: 8px;
-  padding: 6px 10px;
-  background: #166534;
-  color: #fff;
-  cursor: pointer;
-}
-
 .content {
-  margin-top: 8px;
   line-height: 1.65;
 }
 

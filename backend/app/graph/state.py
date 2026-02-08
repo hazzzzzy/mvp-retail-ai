@@ -7,6 +7,7 @@ class GraphState(TypedDict, total=False):
     intent: Literal["report", "diagnose", "plan", "execute"]
     sql: str | None
     rows: list[dict] | None
+    sql_error: dict | None
     knowledge: list[dict] | None
     answer: str | None
     report: dict | None

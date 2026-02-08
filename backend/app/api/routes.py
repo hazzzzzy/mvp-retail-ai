@@ -5,8 +5,10 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from sqlalchemy import text
 
 from app.core.config import get_settings
+from app.db.engine import AsyncSessionLocal
 from app.graph.graph import ainvoke
 
 router = APIRouter(prefix="/api", tags=["api"])
@@ -108,6 +110,55 @@ async def execute(payload: ExecuteRequest):
             "intent": "execute",
             "execution": result.get("execution"),
             "debug": {**(result.get("debug") or {}), "model": settings.deepseek_model},
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/action-logs/summary")
+async def action_logs_summary(limit: int = 20):
+    n = max(1, min(limit, 100))
+    try:
+        async with AsyncSessionLocal() as session:
+            total = await session.scalar(text("SELECT COUNT(*) FROM action_logs"))
+            success_cnt = await session.scalar(text("SELECT COUNT(*) FROM action_logs WHERE status='success'"))
+            failed_cnt = await session.scalar(text("SELECT COUNT(*) FROM action_logs WHERE status='failed'"))
+            last_created_at = await session.scalar(text("SELECT MAX(created_at) FROM action_logs"))
+            latest_rows = (
+                await session.execute(
+                    text(
+                        """
+                        SELECT id, idempotency_key, action_type, status, request_json, error_message, created_at
+                        FROM action_logs
+                        ORDER BY id DESC
+                        LIMIT :n
+                        """
+                    ),
+                    {"n": n},
+                )
+            ).mappings().all()
+
+        total_v = int(total or 0)
+        success_v = int(success_cnt or 0)
+        failed_v = int(failed_cnt or 0)
+        success_rate = round((success_v / total_v) * 100, 2) if total_v > 0 else 0.0
+        summary_text = (
+            f"累计执行日志 {total_v} 条，其中成功 {success_v} 条，失败 {failed_v} 条，"
+            f"成功率 {success_rate:.2f}%。"
+        )
+        if last_created_at is not None:
+            summary_text += f"最近一次执行时间：{last_created_at}。"
+
+        return {
+            "summary": summary_text,
+            "metrics": {
+                "total": total_v,
+                "success": success_v,
+                "failed": failed_v,
+                "success_rate": success_rate,
+                "last_created_at": last_created_at,
+            },
+            "items": [dict(r) for r in latest_rows],
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc

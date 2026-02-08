@@ -1,23 +1,40 @@
 ﻿<template>
   <div class="wrap">
-    <h1>门店经营助手 AI</h1>
-    <div class="examples">
-      <button v-for="s in samples" :key="s" @click="input = s">{{ s }}</button>
-    </div>
+    <el-card class="shell" shadow="never">
+      <template #header>
+        <div class="header">
+          <h1>门店经营助手 AI</h1>
+        </div>
+      </template>
 
-    <div class="messages-panel">
-      <MessageList :messages="messages" @execute="onExecute" />
-    </div>
+      <div class="examples">
+        <el-button v-for="s in samples" :key="s" text bg @click="input = s">{{
+          s
+        }}</el-button>
+      </div>
 
-    <div class="input-row">
-      <input v-model="input" placeholder="请输入问题..." @keyup.enter="onSend" />
-      <button :disabled="loading" @click="onSend">发送</button>
-    </div>
+      <div ref="messagesPanelRef" class="messages-panel">
+        <MessageList :messages="messages" @execute="onExecute" />
+      </div>
+
+      <div class="input-row">
+        <el-input
+          v-model="input"
+          placeholder="请输入问题..."
+          :disabled="loading"
+          @keyup.enter="onSend"
+        />
+        <el-button type="primary" :loading="loading" @click="onSend"
+          >发送</el-button
+        >
+      </div>
+    </el-card>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref } from "vue";
+import { nextTick, ref } from "vue";
+import { ElMessage } from "element-plus";
 import { chatStream, executePlan } from "../api";
 import MessageList from "../components/MessageList.vue";
 
@@ -33,12 +50,25 @@ type Msg = {
 const input = ref("");
 const loading = ref(false);
 const messages = ref<Msg[]>([]);
+const messagesPanelRef = ref<HTMLElement | null>(null);
+let scrollRaf = 0;
+
+function scrollMessagesToBottom() {
+  if (scrollRaf) return;
+  scrollRaf = window.requestAnimationFrame(async () => {
+    await nextTick();
+    const panel = messagesPanelRef.value;
+    if (panel) {
+      panel.scrollTop = panel.scrollHeight;
+    }
+    scrollRaf = 0;
+  });
+}
 
 const samples = [
-  "最近7天各门店GMV、客单价、订单数，按天趋势",
+  "最近7天各门店GMV",
   "这周复购率下降了，可能原因是什么？用数据验证",
   "给高价值老客做一个促复购活动，预算3万，7天",
-  "（先生成方案，再点“执行上架”）"
 ];
 
 async function onSend() {
@@ -48,6 +78,7 @@ async function onSend() {
   loading.value = true;
   messages.value.push({ role: "user", text: query });
   messages.value.push({ role: "assistant", text: "" });
+  scrollMessagesToBottom();
   const assistantIndex = messages.value.length - 1;
 
   try {
@@ -55,6 +86,7 @@ async function onSend() {
       onToken: (token) => {
         const current = messages.value[assistantIndex];
         current.text = (current.text || "") + token;
+        scrollMessagesToBottom();
       },
       onDone: (result) => {
         const current = messages.value[assistantIndex];
@@ -62,15 +94,18 @@ async function onSend() {
         current.report = result.report;
         current.plan = result.plan;
         current.debug = result.debug;
+        scrollMessagesToBottom();
       },
       onError: (message) => {
         const current = messages.value[assistantIndex];
         current.text = `请求失败: ${message}`;
-      }
+        scrollMessagesToBottom();
+      },
     });
   } catch (error: any) {
     const current = messages.value[assistantIndex];
     current.text = `请求失败: ${error.message}`;
+    ElMessage.error(`请求失败: ${error.message}`);
   } finally {
     input.value = "";
     loading.value = false;
@@ -84,43 +119,53 @@ async function onExecute(plan: Record<string, unknown>) {
       role: "assistant",
       text: "执行完成",
       execution: resp.execution,
-      debug: resp.debug
+      debug: resp.debug,
     });
+    scrollMessagesToBottom();
+    ElMessage.success("执行完成");
   } catch (error: any) {
-    messages.value.push({ role: "assistant", text: `执行失败: ${error.message}` });
+    messages.value.push({
+      role: "assistant",
+      text: `执行失败: ${error.message}`,
+    });
+    scrollMessagesToBottom();
+    ElMessage.error(`执行失败: ${error.message}`);
   }
 }
 </script>
 
 <style scoped>
 .wrap {
-  max-width: 1000px;
+  max-width: 1100px;
   margin: 0 auto;
-  padding: 24px;
-  height: 100vh;
+  padding: 16px;
+  height: 100%;
+  overflow: hidden;
+}
+
+.shell {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+:deep(.el-card__body) {
+  height: calc(100% - 65px);
   display: flex;
   flex-direction: column;
   overflow: hidden;
 }
 
-h1 {
-  margin: 0 0 16px;
+.header h1 {
+  margin: 0;
+  font-size: 20px;
 }
 
 .examples {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 10px;
-  margin: 0 0 16px;
-}
-
-.examples button {
-  border: 1px solid #cbd5e1;
-  background: #fff;
-  border-radius: 10px;
-  padding: 10px;
-  cursor: pointer;
-  text-align: left;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
 }
 
 .messages-panel {
@@ -131,27 +176,9 @@ h1 {
 }
 
 .input-row {
-  display: flex;
+  margin-top: 12px;
+  display: grid;
+  grid-template-columns: 1fr 100px;
   gap: 8px;
-  margin-top: 16px;
-  padding: 12px 0 0;
-  background: #f8fafccc;
-  backdrop-filter: blur(6px);
-}
-
-.input-row input {
-  flex: 1;
-  border: 1px solid #cbd5e1;
-  border-radius: 10px;
-  padding: 12px;
-}
-
-.input-row button {
-  border: none;
-  background: #0f766e;
-  color: #fff;
-  border-radius: 10px;
-  padding: 0 18px;
-  cursor: pointer;
 }
 </style>

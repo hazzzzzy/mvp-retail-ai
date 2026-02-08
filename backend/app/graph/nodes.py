@@ -1,61 +1,79 @@
 ﻿from __future__ import annotations
 
-import asyncio
 import json
 import re
 import time
 from typing import Any
 
-import sqlglot
-from sqlglot import exp
-from sqlalchemy import text
-
 from app.core.config import get_settings
 from app.db.crud import create_action_log, create_campaign, get_action_log_by_key, make_idempotency_key
 from app.db.engine import AsyncSessionLocal
 from app.llm.deepseek_client import deepseek_client
-from app.llm.prompts import DIAGNOSE_SYSTEM, PLAN_SYSTEM, ROUTE_INTENT_SYSTEM, SQL_SYSTEM
-from app.rag.chroma_store import chroma_store
+from app.llm.prompts import (
+    DIAGNOSE_SYSTEM,
+    PLAN_EXPLAIN_SYSTEM,
+    PLAN_SYSTEM,
+    REPORT_SUMMARY_SYSTEM,
+    build_route_intent_system,
+    build_diagnosis_fallback,
+    build_diagnosis_user_prompt,
+    build_plan_explain_user_prompt,
+    build_plan_markdown,
+    build_plan_schema_tip,
+    build_plan_user_prompt,
+    build_report_summary_user_prompt,
+)
+from app.graph.tools import kb_query_tool, sql_query_tool
 from app.integrations.crm_client import crm_client
 
 settings = get_settings()
 
 
 def _timer() -> float:
+    # 统一计时起点。
     return time.perf_counter()
 
 
 def _add_timing(state: dict, key: str, start: float) -> None:
+    # 将节点耗时写入 debug.timings_ms，便于链路排障。
     debug = state.setdefault("debug", {})
     timings = debug.setdefault("timings_ms", {})
     timings[key] = int((time.perf_counter() - start) * 1000)
 
 
 def _extract_json_block(s: str) -> dict[str, Any]:
+    # 兼容 LLM 返回的 ```json 包裹文本。
     s = s.strip()
     if s.startswith("```"):
         s = re.sub(r"^```(?:json)?", "", s).strip()
         s = s.removesuffix("```").strip()
+
+    # 兼容解释文本 + JSON 的混合输出，截取最外层 JSON。
     if "{" in s and "}" in s:
         start = s.find("{")
         end = s.rfind("}")
         s = s[start : end + 1]
+
     return json.loads(s)
 
 
 def _extract_budget_duration(query: str) -> tuple[int, int]:
-    budget = 30000
-    duration = 7
+    # 从用户问题解析预算和周期；无法解析时退回配置默认值。
+    budget = settings.plan_default_budget
+    duration = settings.plan_default_duration_days
     q = query.replace(",", "，")
 
+    # 优先识别“x万”格式。
     m_budget = re.search(r"预算\s*([0-9]+(?:\.[0-9]+)?)\s*万", q)
     if m_budget:
         budget = int(float(m_budget.group(1)) * 10000)
     else:
+        # 兜底识别直接金额数字。
         m_budget2 = re.search(r"预算\s*([0-9]+)", q)
         if m_budget2:
             budget = int(m_budget2.group(1))
 
+    # 解析“x天”周期。
     m_duration = re.search(r"([0-9]+)\s*天", q)
     if m_duration:
         duration = int(m_duration.group(1))
@@ -64,162 +82,107 @@ def _extract_budget_duration(query: str) -> tuple[int, int]:
 
 
 async def route_intent(state: dict) -> dict:
+    # 1) 读取输入上下文。
     start = _timer()
     query = state.get("user_query", "")
     plan = state.get("plan")
 
-    intent = "report"
-    if plan and any(k in query for k in ["执行", "上架", "创建", "发布"]):
+    # 2) 若已有结构化 plan，则执行链路优先，避免分类歧义。
+    if plan:
         intent = "execute"
+        llm_result = "skipped_by_plan"
     else:
-        rule_map = [
-            ("report", ["报表", "趋势", "gmv", "订单", "客单价"]),
-            ("diagnose", ["下降", "原因", "怎么回事", "诊断", "为什么"]),
-            ("plan", ["活动", "优惠券", "预算", "策划", "方案"]),
-            ("execute", ["执行", "上架", "创建券", "发布券"]),
-        ]
-        lowered = query.lower()
-        rule_hit = None
-        for i, words in rule_map:
-            if any(w in lowered for w in words):
-                rule_hit = i
-                break
+        # 3) 纯 LLM 分类：使用包含定义与示例的 few-shot 提示词。
+        llm_result = await deepseek_client.chat(system=build_route_intent_system(), user=query, temperature=0)
+        llm_result = llm_result.strip().lower()
+        intent = llm_result if llm_result in {"report", "diagnose", "plan", "execute"} else "report"
 
-        if rule_hit:
-            intent = rule_hit
-            llm_result = "skipped_by_rule"
-        else:
-            llm_result = await deepseek_client.chat(system=ROUTE_INTENT_SYSTEM, user=query, temperature=0)
-            llm_result = llm_result.strip().lower()
-            if llm_result in {"report", "diagnose", "plan", "execute"}:
-                intent = llm_result
-
-        state.setdefault("debug", {})["route_intent"] = {"llm": llm_result, "rule_hit": rule_hit, "final": intent}
+    # 4) 写入调试信息，便于观察分类稳定性。
+    state.setdefault("debug", {})["route_intent"] = {"llm": llm_result, "final": intent, "has_plan": bool(plan)}
 
     _add_timing(state, "route", start)
     return {"intent": intent, "debug": state.get("debug", {})}
 
 
-async def gen_sql(state: dict) -> dict:
-    start = _timer()
-    query = state.get("user_query", "")
-    lowered = query.lower()
-    if any(k in lowered for k in ["gmv", "客单价", "订单数", "趋势", "报表"]):
-        sql = (
-            "SELECT DATE(paid_at) AS dt, store_id, "
-            "SUM(CASE WHEN pay_status=1 THEN amount ELSE 0 END) AS gmv, "
-            "SUM(CASE WHEN pay_status=1 THEN 1 ELSE 0 END) AS order_cnt, "
-            "AVG(CASE WHEN pay_status=1 THEN amount END) AS aov "
-            "FROM orders "
-            "WHERE paid_at >= DATE_SUB(NOW(), INTERVAL 7 DAY) "
-            "GROUP BY DATE(paid_at), store_id "
-            "ORDER BY dt DESC, store_id"
-        )
-    elif any(k in lowered for k in ["复购", "下降", "诊断", "原因"]):
-        sql = (
-            "WITH w AS ("
-            "SELECT member_id, "
-            "SUM(CASE WHEN paid_at >= DATE_SUB(NOW(), INTERVAL 7 DAY) AND pay_status=1 THEN 1 ELSE 0 END) AS c7, "
-            "SUM(CASE WHEN paid_at >= DATE_SUB(NOW(), INTERVAL 14 DAY) AND paid_at < DATE_SUB(NOW(), INTERVAL 7 DAY) AND pay_status=1 THEN 1 ELSE 0 END) AS c14 "
-            "FROM orders WHERE member_id IS NOT NULL GROUP BY member_id"
-            ") "
-            "SELECT "
-            "AVG(CASE WHEN c7>=2 THEN 1 ELSE 0 END) AS repurchase_7d, "
-            "AVG(CASE WHEN c14>=2 THEN 1 ELSE 0 END) AS repurchase_prev_7d "
-            "FROM w"
-        )
-    else:
-        raw = await deepseek_client.chat(system=SQL_SYSTEM, user=query, temperature=0)
-        cleaned = raw.replace("```sql", "").replace("```", "").strip()
-        m = re.search(r"(?is)select\\s.+?(?:;|$)", cleaned)
-        sql = m.group(0).strip() if m else cleaned
-    _add_timing(state, "gen_sql", start)
-    return {"sql": sql, "debug": state.get("debug", {})}
-
-
-async def guard_sql(state: dict) -> dict:
-    sql = (state.get("sql") or "").strip()
-    guard = {"passed": False, "reason": "", "limit_applied": False}
-    parsed_list = sqlglot.parse(sql, read="mysql")
-    if len(parsed_list) != 1:
-        guard["reason"] = "仅允许单条 SQL"
-        state.setdefault("debug", {})["guard"] = guard
-        raise ValueError("SQL 必须为单语句")
-    parsed = parsed_list[0]
-    if not isinstance(parsed, exp.Select):
-        guard["reason"] = "仅允许 SELECT"
-        state.setdefault("debug", {})["guard"] = guard
-        raise ValueError("仅允许 SELECT")
-
-    limit_node = parsed.args.get("limit")
-    max_rows = settings.sql_max_rows
-    if limit_node is None:
-        parsed.set("limit", exp.Limit(expression=exp.Literal.number(max_rows)))
-        guard["limit_applied"] = True
-    else:
-        current_limit = None
-        expr = limit_node.expression
-        if isinstance(expr, exp.Literal) and expr.is_int:
-            current_limit = int(expr.this)
-        if current_limit is None or current_limit > max_rows:
-            parsed.set("limit", exp.Limit(expression=exp.Literal.number(max_rows)))
-            guard["limit_applied"] = True
-
-    final_sql = parsed.sql(dialect="mysql")
-    guard["passed"] = True
-    guard["reason"] = "ok"
-    debug = state.setdefault("debug", {})
-    debug["guard"] = guard
-    debug["sql"] = final_sql
-    return {"sql": final_sql, "debug": debug}
-
-
-async def run_sql(state: dict) -> dict:
-    start = _timer()
-    sql = state.get("sql")
-
-    async def _exec() -> list[dict]:
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(text(sql))
-            return [dict(r) for r in result.mappings().all()]
-
-    rows = await asyncio.wait_for(_exec(), timeout=settings.sql_timeout_seconds)
-    _add_timing(state, "run_sql", start)
-    return {"rows": rows, "debug": state.get("debug", {})}
-
-
-async def retrieve_kb(state: dict) -> dict:
-    start = _timer()
-    query = state.get("user_query", "")
-    knowledge = await chroma_store.query(query, top_k=5)
-    _add_timing(state, "retrieve_kb", start)
-    return {"knowledge": knowledge, "debug": state.get("debug", {})}
-
-
 async def compose_report_answer(state: dict) -> dict:
+    # 1) 组装报表结构。
     start = _timer()
-    rows = state.get("rows") or []
+    query = state.get("user_query", "")
+    intent = state.get("intent", "report")
+    tool_result = await sql_query_tool.ainvoke({"query": query, "intent": intent})
+    rows = tool_result.get("rows") or []
     columns = list(rows[0].keys()) if rows else []
-    answer = "报表已生成。口径说明：GMV 为 pay_status=1 的 amount 汇总；客单价=GMV/成功订单数。"
     stream_cb = state.get("stream_cb")
-    if stream_cb is not None:
-        await stream_cb(answer)
+    debug = state.setdefault("debug", {})
+    debug["tools"] = {
+        **(debug.get("tools") or {}),
+        "sql_query_tool": tool_result.get("debug", {}),
+    }
+
+    # 2) 基于查询结果动态生成自然语言总结，避免固定模板口径。
+    sql_error = tool_result.get("error")
+    if sql_error:
+        answer = f"数据查询执行失败，已自动尝试修复但未成功：{sql_error}。请调整问题口径后重试。"
+        if stream_cb is not None:
+            await stream_cb(answer)
+        _add_timing(state, "compose", start)
+        return {
+            "answer": answer,
+            "report": {"columns": columns, "rows": rows},
+            "debug": debug,
+        }
+
+    if rows:
+        report_prompt = build_report_summary_user_prompt(state.get("user_query", ""), rows)
+        if stream_cb is not None:
+            answer = await deepseek_client.chat_stream(
+                system=REPORT_SUMMARY_SYSTEM,
+                user=report_prompt,
+                temperature=0.2,
+                on_token=stream_cb,
+            )
+        else:
+            answer = await deepseek_client.chat(system=REPORT_SUMMARY_SYSTEM, user=report_prompt, temperature=0.2)
+        if not answer.strip():
+            answer = f"已返回 {len(rows)} 条数据，请查看下方表格。"
+    else:
+        answer = "未查到匹配数据。建议调整时间范围、门店范围或指标口径后重试。"
+        if stream_cb is not None:
+            await stream_cb(answer)
+
+    # 3) 回传 answer + report。
     _add_timing(state, "compose", start)
     return {
         "answer": answer,
         "report": {"columns": columns, "rows": rows},
-        "debug": state.get("debug", {}),
+        "debug": debug,
     }
 
 
 async def compose_diagnosis_answer(state: dict) -> dict:
+    # 1) 准备数据证据与知识证据上下文。
     start = _timer()
-    rows = state.get("rows") or []
-    knowledge = state.get("knowledge") or []
+    query = state.get("user_query", "")
+    intent = state.get("intent", "diagnose")
+    sql_result = await sql_query_tool.ainvoke({"query": query, "intent": intent})
+    # 诊断口径查不到数据时，自动降级到报表口径再查一次，避免“样本为空”。
+    if (not sql_result.get("error")) and not (sql_result.get("rows") or []):
+        fallback_sql_result = await sql_query_tool.ainvoke({"query": query, "intent": "report"})
+        if fallback_sql_result.get("rows"):
+            sql_result = fallback_sql_result
+    kb_result = await kb_query_tool.ainvoke({"query": query, "top_k": 5})
+    rows = sql_result.get("rows") or []
+    knowledge = kb_result.get("knowledge") or []
     stream_cb = state.get("stream_cb")
-    data_sample = json.dumps(rows[:5], ensure_ascii=False, default=str)
-    kb_sample = "\n".join([f"- {k['title']}: {k['content']}" for k in knowledge])
-    user_prompt = f"用户问题：{state.get('user_query')}\n数据样本：{data_sample}\n知识要点：\n{kb_sample}"
+    user_prompt = build_diagnosis_user_prompt(query, rows, knowledge)
+    debug = state.setdefault("debug", {})
+    debug["tools"] = {
+        **(debug.get("tools") or {}),
+        "sql_query_tool": sql_result.get("debug", {}),
+        "kb_query_tool": kb_result.get("debug", {}),
+    }
+
+    # 2) 根据是否需要流式，选择普通/流式 LLM 调用。
     if stream_cb is not None:
         answer = await deepseek_client.chat_stream(
             system=DIAGNOSE_SYSTEM,
@@ -230,86 +193,54 @@ async def compose_diagnosis_answer(state: dict) -> dict:
     else:
         answer = await deepseek_client.chat(system=DIAGNOSE_SYSTEM, user=user_prompt, temperature=0.2)
 
+    # 3) 若未满足“来源标注”约束，降级为兜底诊断模板。
     if "(data)" not in answer or "(kb)" not in answer:
-        answer = (
-            "1. 发现：近7天复购相关指标出现下滑，且部分门店支付成功率下降 (data)\n"
-            "2. 原因假设：可能由券到期、触达下降、支付失败上升等导致 (kb)\n"
-            "3. 验证：需按老客下单率、支付成功率、渠道占比分解对比近14天 (data)\n"
-            "4. 下一步：优先做老客定向券并监控核销与支付链路，设置预算上限 (kb)"
-        )
+        answer = build_diagnosis_fallback()
+
     _add_timing(state, "compose", start)
-    return {"answer": answer, "debug": state.get("debug", {})}
+    return {"answer": answer, "debug": debug}
 
 
 async def gen_campaign_plan(state: dict) -> dict:
+    # 1) 解析预算/周期并准备知识上下文。
     start = _timer()
     query = state.get("user_query", "")
-    knowledge = state.get("knowledge") or []
+    kb_result = await kb_query_tool.ainvoke({"query": query, "top_k": 5})
+    knowledge = kb_result.get("knowledge") or []
     budget, duration = _extract_budget_duration(query)
     kb_text = "\n".join([f"- {k['title']}: {k['content']}" for k in knowledge])
-    schema_tip = {
-        "goal": "string",
-        "duration_days": duration,
-        "budget": budget,
-        "target_segment": {"definition": "string", "rules": ["..."]},
-        "offer": {"type": "full_reduction|discount|points", "threshold": 0, "value": 0, "max_redemptions": 0},
-        "channels": ["app_push", "sms", "wechat"],
-        "kpi": {"primary": "repeat_rate", "targets": ["..."]},
-        "risk_controls": ["..."],
-        "sql_preview": "optional string",
+    debug = state.setdefault("debug", {})
+    debug["tools"] = {
+        **(debug.get("tools") or {}),
+        "kb_query_tool": kb_result.get("debug", {}),
     }
-    user_prompt = f"用户需求：{query}\n预算默认：{budget}\n周期默认：{duration}\n知识库：\n{kb_text}\n输出schema：{json.dumps(schema_tip, ensure_ascii=False)}"
+
+    # 2) 生成 schema 约束与用户提示，调用 LLM 产出结构化 plan。
+    schema_tip = build_plan_schema_tip(settings, budget=budget, duration=duration)
+    user_prompt = build_plan_user_prompt(query, budget, duration, kb_text, schema_tip)
     raw = await deepseek_client.chat(system=PLAN_SYSTEM, user=user_prompt, temperature=0.2)
     plan = _extract_json_block(raw)
+
+    # 3) 兜底补齐关键字段，确保后续可执行。
     plan.setdefault("budget", budget)
     plan.setdefault("duration_days", duration)
-    target = plan.get("target_segment") or {}
-    offer = plan.get("offer") or {}
-    kpi = plan.get("kpi") or {}
-    risk_controls = plan.get("risk_controls") or []
-    channels = plan.get("channels") or []
-    rules = target.get("rules") if isinstance(target, dict) else []
-    targets = kpi.get("targets") if isinstance(kpi, dict) else []
 
-    rules_md = "\n".join([f"- {x}" for x in rules[:4]]) if isinstance(rules, list) and rules else "- 使用近30天高价值老客标签"
-    risk_md = (
-        "\n".join([f"- {x}" for x in risk_controls[:4]])
-        if isinstance(risk_controls, list) and risk_controls
-        else "- 单用户限领1次，预算超 80% 触发预警"
-    )
-    channels_md = (
-        "、".join([str(x) for x in channels if x]) if isinstance(channels, list) and channels else "App Push、短信、企业微信"
-    )
-    kpi_md = "\n".join([f"- {x}" for x in targets[:3]]) if isinstance(targets, list) and targets else "- 7天复购率提升 2~3 个百分点"
-
-    answer = (
-        f"## 促复购活动方案\n\n"
-        f"已基于你的要求生成方案，建议周期 **{plan.get('duration_days', duration)} 天**，"
-        f"预算 **{plan.get('budget', budget)} 元**，目标是 **{plan.get('goal', '提升复购')}**。\n\n"
-        f"### 1. 人群策略\n"
-        f"- 人群定义：{target.get('definition', '近30天有消费且客单价较高的老客') if isinstance(target, dict) else '近30天高价值老客'}\n"
-        f"{rules_md}\n\n"
-        f"### 2. 优惠策略\n"
-        f"- 类型：{offer.get('type', 'full_reduction')}\n"
-        f"- 门槛：满 {offer.get('threshold', 99)} 元\n"
-        f"- 面额/折扣：{offer.get('value', 20)}\n"
-        f"- 发放上限：{offer.get('max_redemptions', 1000)}\n"
-        f"- 触达渠道：{channels_md}\n\n"
-        f"### 3. KPI 目标\n"
-        f"- 主指标：{kpi.get('primary', 'repeat_rate') if isinstance(kpi, dict) else 'repeat_rate'}\n"
-        f"{kpi_md}\n\n"
-        f"### 4. 风险控制\n"
-        f"{risk_md}\n\n"
-        f"确认后可直接点击 **执行上架（场景D）** 进入发布闭环。"
-    )
+    # 4) 基于“用户需求 + 知识 + 结构化 plan”由 LLM 动态生成方案说明。
+    explain_user = build_plan_explain_user_prompt(query, knowledge, plan)
+    answer = await deepseek_client.chat(system=PLAN_EXPLAIN_SYSTEM, user=explain_user, temperature=0.2)
+    if not answer.strip():
+        # 5) 若生成异常，退回通用兜底文案（不写死具体促销参数）。
+        answer = build_plan_markdown(plan, settings, budget=budget, duration=duration)
     stream_cb = state.get("stream_cb")
     if stream_cb is not None:
         await stream_cb(answer)
+
     _add_timing(state, "compose", start)
-    return {"plan": plan, "answer": answer, "debug": state.get("debug", {})}
+    return {"plan": plan, "answer": answer, "debug": debug}
 
 
 async def execute_campaign(state: dict) -> dict:
+    # 1) 准备执行输入并对 plan 做最小修复。
     start = _timer()
     plan = state.get("plan") or {}
     debug = state.setdefault("debug", {})
@@ -318,17 +249,30 @@ async def execute_campaign(state: dict) -> dict:
     required_offer_keys = {"type", "threshold", "value", "max_redemptions"}
     if "offer" not in plan or not required_offer_keys.issubset(set(plan.get("offer", {}).keys())):
         plan.setdefault("offer", {})
-        plan["offer"].setdefault("type", "full_reduction")
-        plan["offer"].setdefault("threshold", 99)
-        plan["offer"].setdefault("value", 20)
-        plan["offer"].setdefault("max_redemptions", 1000)
-        plan.setdefault("duration_days", 7)
-        plan.setdefault("goal", "提升复购")
+        plan["offer"].setdefault("type", settings.plan_default_offer_type)
+        plan["offer"].setdefault("threshold", settings.plan_default_offer_threshold)
+        plan["offer"].setdefault("value", settings.plan_default_offer_value)
+        plan["offer"].setdefault("max_redemptions", settings.plan_default_offer_max_redemptions)
+        plan.setdefault("duration_days", settings.plan_default_duration_days)
+        plan.setdefault("goal", settings.plan_default_goal)
+        plan.setdefault("budget", settings.plan_default_budget)
+        plan.setdefault("channels", settings.plan_channels)
+        plan.setdefault(
+            "target_segment",
+            {"definition": settings.plan_default_target_definition, "rules": settings.plan_target_rules},
+        )
+        plan.setdefault(
+            "kpi",
+            {"primary": settings.plan_default_kpi_primary, "targets": settings.plan_kpi_targets},
+        )
+        plan.setdefault("risk_controls", settings.plan_risk_controls)
         debug["plan_fixed"] = True
 
+    # 2) 生成幂等键，防止重复执行。
     idem_key = make_idempotency_key(plan)
 
     async with AsyncSessionLocal() as session:
+        # 3) 已成功执行过则直接返回历史结果。
         existing = await get_action_log_by_key(session, idem_key)
         if existing and existing.status == "success":
             execution = json.loads(existing.response_json)
@@ -336,25 +280,27 @@ async def execute_campaign(state: dict) -> dict:
             return {"execution": execution, "debug": debug}
 
         try:
+            # 4) 先落库 campaign，再调用 CRM 创建并发布券。
             campaign_name = f"campaign-{int(time.time())}"
             await create_campaign(
                 session,
                 name=campaign_name,
-                goal=plan.get("goal", "促复购"),
-                budget=float(plan.get("budget", 30000)),
-                duration_days=int(plan.get("duration_days", 7)),
+                goal=plan.get("goal", settings.plan_default_goal),
+                budget=float(plan.get("budget", settings.plan_default_budget)),
+                duration_days=int(plan.get("duration_days", settings.plan_default_duration_days)),
                 plan=plan,
             )
 
             create_payload = {
                 "name": campaign_name,
                 "offer": plan["offer"],
-                "duration_days": int(plan.get("duration_days", 7)),
+                "duration_days": int(plan.get("duration_days", settings.plan_default_duration_days)),
             }
             created = await crm_client.create_coupon(create_payload)
             coupon_id = int(created["coupon_id"])
             published = await crm_client.publish_coupon(coupon_id)
 
+            # 5) 记录成功日志并提交事务。
             execution = {
                 "idempotency_key": idem_key,
                 "coupon_id": coupon_id,
@@ -374,6 +320,7 @@ async def execute_campaign(state: dict) -> dict:
             _add_timing(state, "execute", start)
             return {"execution": execution, "debug": debug}
         except Exception as exc:
+            # 6) 记录失败日志，返回失败结构，保证调用方可感知错误。
             execution = {
                 "idempotency_key": idem_key,
                 "coupon_id": None,
@@ -392,4 +339,3 @@ async def execute_campaign(state: dict) -> dict:
             await session.commit()
             _add_timing(state, "execute", start)
             return {"execution": execution, "debug": debug}
-
